@@ -4,13 +4,17 @@ from rclpy.clock import Clock
 from nav_msgs.msg import OccupancyGrid
 from nav_msgs.msg import Path
 from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist 
 from geometry_msgs.msg import PoseStamped
 import numpy as np
 from skimage.segmentation import flood, flood_fill
 from skimage import io, morphology, img_as_ubyte
-#from graph import Graph, get_adjacency, display_adjacency
 from typing import List, Tuple
 import heapq
+import math
+
+import tf2_ros
+import tf2_geometry_msgs
 
 # To save map in the good file (Debug)
 path_image_save = '/home/robot/Desktop/'
@@ -25,14 +29,29 @@ class MyNode(Node):
         path_topic = '/path'
         position_topic = '/ground_truth'
         goal_topic = '/goal_pose'
+        nav_topic = 'cmd_vel'
 
         self.map_sub = self.create_subscription(OccupancyGrid, map_topic, self.map_callback, 1)
         self.pos_sub = self.create_subscription(Odometry, position_topic, self.odom_callback, 1)
         self.goal_sub = self.create_subscription(PoseStamped, goal_topic, self.goal_callback, 1)
         self.path_pub = self.create_publisher(Path, path_topic, 10)
 
-        self.postion = (0, 0, 0)
+        self.position = (0, 0, 0)
         self.map = [[]]
+
+        self.publisher_ = self.create_publisher(Twist, nav_topic, 10)
+        timer_period = 0.5  # seconds
+        self.cmd = Twist()
+        self.timer = self.create_timer(timer_period, self.timer_callback)
+        self.timer_callback()
+
+        self.path = None
+        self.last_pos = 10
+        self.max_speed = 0.2
+
+    def timer_callback(self):
+        self.publisher_.publish(self.cmd)
+        self.get_logger().info('Publishing: "{0}, {1}"'.format(self.cmd.linear.x, self.cmd.angular.z))
 
     def goal_callback(self, data):
         print("Update goal")
@@ -43,16 +62,16 @@ class MyNode(Node):
         map_binary = self.map
 
         # Get the starting point
-        y, x = self.convertion(map_binary, self.postion[0], self.postion[1], True)
+        y, x = self.convertion(map_binary, self.position[0], self.position[1], True)
         y_goal, x_goal = self.convertion(map_binary, position_x, position_y, True)
 
         # Get the drivable_area
-        map_binary = self.get_drivable_area(morphology.erosion(map_binary, morphology.square(10)), x, y)
+        map_binary = self.get_drivable_area(morphology.erosion(map_binary, morphology.square(15)), x, y)
         #self.save_map(map_binary, "map_drive.png")
 
         # Create a copy of the drivable area and erose for safe travel
         safe_area = morphology.erosion(map_binary, morphology.square(4))
-        #self.save_map(safe_area, "map_safe.png")
+        self.save_map(safe_area, "map_safe.png")
 
         start_point = (x, y)
         end_point = (x_goal, y_goal)
@@ -60,17 +79,33 @@ class MyNode(Node):
         a_star = AStar()
         path = a_star.astar(safe_area, start_point, end_point)
 
-        """for x in path:
-            print(x," -> ", self.convertion(map_binary, x[0], x[1], False))"""
-
+        for i, coord in enumerate(path):
+            #print(x," -> ", self.convertion(map_binary, coord[0], coord[1], False))
+            x, y = self.convertion(map_binary, coord[0], coord[1], False)
+            path[i] = (x, y)
+        
         self.publish_path(path, map_binary, 10)
 
     def odom_callback(self, data):
         #print("Update odom")
         position_x = data.pose.pose.position.x
         position_y = data.pose.pose.position.y
-        orientation = data.pose.pose.orientation
-        self.postion = (position_x, position_y, orientation)
+        orientation = data.pose.pose.orientation.z
+        self.position = (position_x, position_y, orientation)
+
+        #if False:
+        if self.path is not None:
+            theta = orientation
+
+            # get current speed from odom message
+            current_speed = data.twist.twist.linear.x
+
+            # get the desired speed and steering angle from the pure pursuit
+            speed, angle = self.pure_pursuit(position_x, position_y, theta, current_speed, self.path.poses)
+
+            self.cmd.linear.x = float(speed)
+            self.cmd.angular.z = angle
+
     
     def map_callback(self, data):
         """ 
@@ -80,6 +115,69 @@ class MyNode(Node):
         occupied_thresh = 0.65
         self.map = self.get_binary_map(data, occupied_thresh)
         #self.save_map(self.map, "map.png")
+
+# calculate the nearest desirable point to steer towards and how to get there
+    def pure_pursuit(self, current_x, current_y, heading, last_speed, path):
+        current_x = self.position[0]
+        current_y = self.position[1]
+        lookahead = 0.4
+
+        # check if we have a path yet
+        if path is None:
+            return 0, 0
+
+        closest_point = None
+
+        # iterate through the path and check if we find a closer point
+        # we start checking at the last position we wanted to drive to and go from there
+        for i in range(self.last_pos, len(path)):
+            x = path[i].pose.position.x
+            y = path[i].pose.position.y
+
+            distance = math.hypot(current_x-x, current_y-y)
+
+            # if we found a point far enough ahead, mark the point and in the future
+            # don't look at anything closer than it
+            if lookahead < distance:
+                closest_point = (x, y)
+                self.last_pos = i
+                break
+
+        # we have found a closest point, navigate towards it
+        if closest_point is not None:
+            goal = closest_point
+
+        # we have not found one, navigate to the last point in the path
+        else:
+            goal = (path[-1].pose.position.x, path[-1].pose.position.y)
+
+            # set last position to last point on path
+            self.last_pos = len(path)-1
+
+        speed, theta = self.calc_speed_angle(current_x, current_y, goal[0], goal[1], heading, last_speed)
+
+        # update the goal marker visualization
+        #self.publish_marker_visualization(goal, 0)
+
+        return speed, theta
+
+    def calc_speed_angle(self, is_x, is_y, wasnt_x, wasnt_y, current_heading, speed):
+
+        # calculate the desired heading
+        target = math.atan2(wasnt_y - is_y, wasnt_x - is_x)
+        correction = target - current_heading
+
+        # if we need to turn more than 180 deg left, flip the angle
+        if correction > math.pi:
+            correction -= 2 * math.pi
+
+        # same for the other way
+        if correction < -math.pi:
+            correction += 2* math.pi
+
+        return self.max_speed, correction
+
+
 
     def convertion(self, map : List[List[bool]], x, y, type: bool):
         """"
@@ -159,18 +257,18 @@ class MyNode(Node):
                 if i == 0 or i == len(path)-1:
                     pose = PoseStamped()
 
-                    X, Y = self.convertion(map, float(coord[0]), float(coord[1]), False)
-                    pose.pose.position.x = Y  # Coordonnée x
-                    pose.pose.position.y = X  # Coordonnée y
+                    #X, Y = self.convertion(map, float(coord[0]), float(coord[1]), False)
+                    pose.pose.position.x = coord[1]  # Coordonnée x
+                    pose.pose.position.y = coord[0]  # Coordonnée y
                     pose.pose.position.z = 0.0  # Coordonnée z (0.0 pour 2D)
 
                     path_msg.poses.append(pose)
                 elif i % n_sparse == 0:
                     pose = PoseStamped()
 
-                    X, Y = self.convertion(map, float(coord[0]), float(coord[1]), False)
-                    pose.pose.position.x = Y  # Coordonnée x
-                    pose.pose.position.y = X  # Coordonnée y
+                    #X, Y = self.convertion(map, float(coord[0]), float(coord[1]), False)
+                    pose.pose.position.x = coord[1]  # Coordonnée x
+                    pose.pose.position.y = coord[0]  # Coordonnée y
                     pose.pose.position.z = 0.0  # Coordonnée z (0.0 pour 2D)
 
                     path_msg.poses.append(pose)
@@ -178,6 +276,7 @@ class MyNode(Node):
             print("sah y a rien")
 
         self.path_pub.publish(path_msg)
+        self.path = path_msg
 
 class AStar:
     def heuristic(self, a, b):
@@ -212,7 +311,7 @@ class AStar:
             closed_set.add(current)
 
             # Schearch neighbor
-            for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+            for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, -1), (-1, 1)]:
                 neighbor = current[0] + dx, current[1] + dy
 
                 if neighbor[0] < 0 or neighbor[0] >= rows or neighbor[1] < 0 or neighbor[1] >= cols:
