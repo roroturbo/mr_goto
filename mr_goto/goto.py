@@ -14,7 +14,9 @@ import heapq
 import math
 
 import tf2_ros
-import tf2_geometry_msgs
+from tf2_geometry_msgs import PointStamped
+from geometry_msgs.msg import Quaternion
+import math
 
 # To save map in the good file (Debug)
 path_image_save = '/home/robot/Desktop/'
@@ -37,10 +39,11 @@ class MyNode(Node):
         self.path_pub = self.create_publisher(Path, path_topic, 10)
 
         self.position = (0, 0, 0)
+        self.goal = (0, 0, 0)
         self.map = [[]]
 
         self.publisher_ = self.create_publisher(Twist, nav_topic, 10)
-        timer_period = 0.5  # seconds
+        timer_period = 0.1  # seconds
         self.cmd = Twist()
         self.timer = self.create_timer(timer_period, self.timer_callback)
         self.timer_callback()
@@ -51,13 +54,14 @@ class MyNode(Node):
 
     def timer_callback(self):
         self.publisher_.publish(self.cmd)
-        self.get_logger().info('Publishing: "{0}, {1}"'.format(self.cmd.linear.x, self.cmd.angular.z))
+        #self.get_logger().info('Publishing: "{0}, {1}"'.format(self.cmd.linear.x, self.cmd.angular.z))
 
     def goal_callback(self, data):
         print("Update goal")
         position_x = data.pose.position.x
         position_y = data.pose.position.y
-        orientation = data.pose.orientation
+        orientation = data.pose.orientation.z
+        self.goal = (position_x, position_y, orientation)
 
         map_binary = self.map
 
@@ -93,20 +97,23 @@ class MyNode(Node):
         orientation = data.pose.pose.orientation.z
         self.position = (position_x, position_y, orientation)
 
+        roll, pitch, theta = orientation.to_euler()
+
+        path = self.path
+
         #if False:
-        if self.path is not None:
-            theta = orientation
+        if path is not None:
+            goal = self.find_target(path.poses, position_x, position_y)
 
-            # get current speed from odom message
-            current_speed = data.twist.twist.linear.x
+            diff_angle = math.atan2(goal[0] - position_x, goal[1] - position_y)
+            print(diff_angle)
 
-            # get the desired speed and steering angle from the pure pursuit
-            speed, angle = self.pure_pursuit(position_x, position_y, theta, current_speed, self.path.poses)
+            if abs(diff_angle) > 0.3: # 25°
+                self.pose_matching(diff_angle)
+            else:
+                self.cmd.linear.x = float(self.max_speed)
+                self.cmd.angular.z = self.compute_target(position_x, position_y, goal[0], goal[1], theta)
 
-            self.cmd.linear.x = float(speed)
-            self.cmd.angular.z = angle
-
-    
     def map_callback(self, data):
         """ 
             Process the map to pre-compute the path to follow and publish it
@@ -116,52 +123,45 @@ class MyNode(Node):
         self.map = self.get_binary_map(data, occupied_thresh)
         #self.save_map(self.map, "map.png")
 
-# calculate the nearest desirable point to steer towards and how to get there
-    def pure_pursuit(self, current_x, current_y, heading, last_speed, path):
-        current_x = self.position[0]
-        current_y = self.position[1]
-        lookahead = 0.4
+    def pose_matching(self, diff_angle):
+        """
+            Match the goal orientation
+        """
+        if diff_angle > 0:
+            self.cmd.linear.x = 0.0
+            self.cmd.angular.z = 0.1
+        elif diff_angle < 0: 
+            self.cmd.linear.x = 0.0
+            self.cmd.angular.z = -0.1
+        elif diff_angle == 0: 
+            self.cmd.linear.x = 0.0
+            self.cmd.angular.z = 0.0
 
-        # check if we have a path yet
-        if path is None:
-            return 0, 0
+    def find_target(self, path, current_x, current_y):
+        lookahead = 0.4
 
         closest_point = None
 
-        # iterate through the path and check if we find a closer point
-        # we start checking at the last position we wanted to drive to and go from there
         for i in range(self.last_pos, len(path)):
             x = path[i].pose.position.x
             y = path[i].pose.position.y
 
             distance = math.hypot(current_x-x, current_y-y)
 
-            # if we found a point far enough ahead, mark the point and in the future
-            # don't look at anything closer than it
             if lookahead < distance:
                 closest_point = (x, y)
                 self.last_pos = i
                 break
 
-        # we have found a closest point, navigate towards it
         if closest_point is not None:
             goal = closest_point
-
-        # we have not found one, navigate to the last point in the path
         else:
             goal = (path[-1].pose.position.x, path[-1].pose.position.y)
-
-            # set last position to last point on path
             self.last_pos = len(path)-1
 
-        speed, theta = self.calc_speed_angle(current_x, current_y, goal[0], goal[1], heading, last_speed)
+        return goal
 
-        # update the goal marker visualization
-        #self.publish_marker_visualization(goal, 0)
-
-        return speed, theta
-
-    def calc_speed_angle(self, is_x, is_y, wasnt_x, wasnt_y, current_heading, speed):
+    def compute_target(self, is_x, is_y, wasnt_x, wasnt_y, current_heading):
 
         # calculate the desired heading
         target = math.atan2(wasnt_y - is_y, wasnt_x - is_x)
@@ -175,7 +175,7 @@ class MyNode(Node):
         if correction < -math.pi:
             correction += 2* math.pi
 
-        return self.max_speed, correction
+        return correction
 
 
 
