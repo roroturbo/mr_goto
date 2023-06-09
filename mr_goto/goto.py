@@ -51,6 +51,7 @@ class MyNode(Node):
         self.lookahead_distance = 0.05
         self.path = None
         self.last_pos = 1
+        self.next_pose = 2
         self.max_speed = 0.2
 
     def timer_callback(self):
@@ -59,6 +60,8 @@ class MyNode(Node):
 
     def goal_callback(self, data):
         print("Update goal")
+        self.last_pos = 1
+        self.next_pose = 2
         position_x = data.pose.position.x
         position_y = data.pose.position.y
         orientation = data.pose.orientation.z
@@ -119,17 +122,22 @@ class MyNode(Node):
         theta = euler[2]
 
         path = self.path
-        # get current speed from odom message
-        current_speed = data.twist.twist.linear.x
 
         #if False:
         if path is not None:
-            # get the desired speed and steering angle from the pure pursuit
-            speed, angle = self.pure_pursuit(self.position[0], self.position[1], theta, current_speed)
+            follow_path = True
+            if follow_path == True: # Follow the path
+                speed, angle = self.pure_pursuit(self.position[0], self.position[1], theta)
+            else: # Just go a goal point without obstacle
+                diff_pose = abs(self.goal[0] - position_x + self.goal[1] - position_y)
+                if diff_pose < 0.1:
+                    diff_angle = theta - self.theta_goal
+                    speed, angle = self.match_orientation(diff_angle)
+                else:
+                    speed, angle = self.goto_point(position_x, position_y, self.goal[0], self.goal[1], theta)
+            
             self.cmd.linear.x = speed
             self.cmd.angular.z = angle
-
-
 
     def euler_from_quaternion(self,quaternion):
         """
@@ -154,6 +162,7 @@ class MyNode(Node):
         yaw = np.arctan2(siny_cosp, cosy_cosp)
 
         return roll, pitch, yaw
+    
     def map_callback(self, data):
         """ 
             Process the map to pre-compute the path to follow and publish it
@@ -162,13 +171,26 @@ class MyNode(Node):
         occupied_thresh = 0.65
         self.map = self.get_binary_map(data, occupied_thresh)
         #self.save_map(self.map, "map.png")
-    def pose_matching(self, diff_angle):
+
+    def match_orientation(self, diff_angle):
         """
             Match the goal orientation
         """
+        diff_angle = math.degrees(diff_angle)
+        if abs(diff_angle) > 0.5 : 
+                if diff_angle > 0.0:
+                    speed = 0.0
+                    theta = -0.1
+                elif diff_angle < 0.0: 
+                    speed = 0.0
+                    theta = 0.1
+        else: 
+            speed = 0.0
+            theta = 0.0  
+                              
+        return speed, theta
 
-
-    def pure_pursuit(self, current_x, current_y, heading, last_speed):
+    def pure_pursuit(self, current_x, current_y, heading):
         lookahead = self.lookahead_distance
         path = self.path.poses
         closest_point = None
@@ -186,6 +208,8 @@ class MyNode(Node):
             if lookahead < distance:
                 closest_point = (x, y)
                 self.last_pos = i
+                if self.last_pos != len(path)-1:
+                    self.next_pose = (path[i+1].pose.position.x, path[i+1].pose.position.y)
                 break
 
         # we have found a closest point, navigate towards it
@@ -199,28 +223,20 @@ class MyNode(Node):
             # set last position to last point on path
             self.last_pos = len(path)-1
 
-
-
-        if self.last_pos == len(path)-1:
+        diff_pose = abs(goal[0] - current_x + goal[1] - current_y)
+        if self.last_pos == len(path)-1 and diff_pose < 0.1:
             diff_angle = heading - self.theta_goal
-            if diff_angle != 0.0 : 
-                if diff_angle > 0.0:
-                    speed = 0.0
-                    theta = -0.1
-                elif diff_angle < 0.0: 
-                    speed = 0.0
-                    theta = 0.1
-            elif diff_angle == 0: 
-                    speed = 0.0
-                    theta = 0.0            
-            return speed, theta
-
-
-        speed, theta = self.calc_speed_angle(current_x, current_y, goal[0], goal[1], heading, last_speed)
-
+            speed, theta = self.match_orientation(diff_angle)
+        else:
+            """diff_angle = math.atan2(goal[1] - self.next_pose[1], goal[0] - self.next_pose[0]) - heading
+            if math.degrees(diff_angle) > 45.0:
+                speed, theta = self.match_orientation(diff_angle)
+            else:"""
+            speed, theta = self.goto_point(current_x, current_y, goal[0], goal[1], heading)
+        
         return speed, theta
 
-    def calc_speed_angle(self, is_x, is_y, wasnt_x, wasnt_y, current_heading, speed):
+    def goto_point(self, is_x, is_y, wasnt_x, wasnt_y, current_heading):
 
         # calculate the desired heading
         target = math.atan2(wasnt_y - is_y, wasnt_x - is_x)
@@ -235,7 +251,6 @@ class MyNode(Node):
             correction += 2* math.pi
 
         return self.max_speed, correction
-
 
     def convertion(self, map : List[List[bool]], x, y, type: bool):
         """"
