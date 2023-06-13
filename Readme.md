@@ -55,7 +55,7 @@ To change the map, you have to change in the launch file the parameters of `stag
 
 # Documentation details
 
-Points :
+Points : More or less 310 points (Roland and Colin exactly equally distributed work)
 
 ## 1. GoTo
 
